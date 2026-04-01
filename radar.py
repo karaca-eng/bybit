@@ -15,7 +15,7 @@ WHALE_CHG_3M = 2.0  # Balina için 3dk'da %2.0 Değişim
 NORMAL_LIMIT_3M = 1.1  # Normal sinyal barajı
 TRI_WINDOW = 180  # 3 Dakika Analiz Penceresi
 
-MAX_DISPLAY_ROWS = 300
+MAX_DISPLAY_ROWS = 100
 SHORT_WINDOW = 60  # 1m
 MID_WINDOW = 300  # 5m
 LONG_WINDOW = 900  # 15m
