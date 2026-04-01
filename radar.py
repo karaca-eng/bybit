@@ -9,12 +9,19 @@ import requests
 from datetime import datetime
 from collections import deque
 
-# --- CONFIGURATION (BYBIT V5) ---
-WHALE_VOL_3M = 80000     # Balina Hacmi
-WHALE_CHG_3M = 1.5       # % Değişim
+# --- CONFIGURATION ---
+WHALE_VOL_3M = 70000     
+WHALE_CHG_3M = 1.3       
 NORMAL_LIMIT_3M = 0.8
 TRI_WINDOW = 180         
 MAX_DISPLAY_ROWS = 50 
+
+# API Çökerse kullanılacak acil durum listesi
+FALLBACK_SYMBOLS = [
+    "BTCUSDT", "ETHUSDT", "SOLUSDT", "AVAXUSDT", "XRPUSDT", "ADAUSDT", "LINKUSDT", "DOTUSDT", "MATICUSDT", 
+    "LTCUSDT", "BCHUSDT", "SHIBUSDT", "DOGEUSDT", "TRXUSDT", "UNIUSDT", "NEARUSDT", "APTUSDT", "OPUSDT", 
+    "ARBUSDT", "INJUSDT", "TIAUSDT", "SEIUSDT", "ORDIUSDT", "SUIUSDT", "PEPEUSDT", "FILUSDT", "RNDRUSDT"
+]
 
 class MarketRadar:
     def __init__(self):
@@ -25,12 +32,12 @@ class MarketRadar:
         self.lock = threading.RLock() 
         self.last_heartbeat = 0  
         self.total_pairs = 0
-        self.last_reset_hour = datetime.now().hour
-        self.log_messages = deque(maxlen=5) # Hata ayıklama günlüğü
+        self.log_messages = deque(maxlen=8)
 
     def add_log(self, msg):
         t = datetime.now().strftime("%H:%M:%S")
-        self.log_messages.append(f"[{t}] {msg}")
+        with self.lock:
+            self.log_messages.append(f"[{t}] {msg}")
 
     def process_ticker(self, data):
         if "data" not in data: return
@@ -46,7 +53,7 @@ class MarketRadar:
                 if price <= 0: return
 
                 if symbol not in self.history: 
-                    self.history[symbol] = deque(maxlen=600)
+                    self.history[symbol] = deque(maxlen=500)
                 
                 self.history[symbol].append((now, price, turnover))
                 self.total_pairs = len(self.history)
@@ -58,7 +65,6 @@ class MarketRadar:
         if len(hist) < 5: return
         current = hist[-1]
         past_3m = next((x for x in hist if now - x[0] <= TRI_WINDOW), hist[0])
-        
         chg_3m = ((current[1] - past_3m[1]) / past_3m[1]) * 100
         vol_3m = current[2] - past_3m[2]
 
@@ -68,21 +74,18 @@ class MarketRadar:
         if vol_3m >= WHALE_VOL_3M and abs(chg_3m) >= WHALE_CHG_3M:
             res_type = "PUMP" if chg_3m > 0 else "DUMP"
             is_whale = True
-        elif vol_3m >= 25000 and abs(chg_3m) >= NORMAL_LIMIT_3M:
+        elif vol_3m >= 20000 and abs(chg_3m) >= NORMAL_LIMIT_3M:
             res_type = "PUMP" if chg_3m > 0 else "DUMP"
             is_whale = False
 
         if res_type:
             past_1m = next((x for x in hist if now - x[0] <= 60), hist[0])
-            past_5m = next((x for x in hist if now - x[0] <= 300), hist[0])
             c1 = ((current[1] - past_1m[1]) / past_1m[1]) * 100
-            c5 = ((current[1] - past_5m[1]) / past_5m[1]) * 100
-            self.add_signal(symbol, current[1], c1, chg_3m, c5, res_type, is_whale)
+            self.add_signal(symbol, current[1], c1, chg_3m, res_type, is_whale)
 
-    def add_signal(self, symbol, price, c1, c3, c5, s_type, is_whale):
+    def add_signal(self, symbol, price, c1, c3, s_type, is_whale):
         t_str = datetime.now().strftime("%H:%M:%S")
         with self.lock:
-            # Spam önleme
             for s in self.signals[:3]:
                 if s['Symbol'] == symbol and s['P/D'] == s_type: return
             
@@ -94,7 +97,7 @@ class MarketRadar:
             self.signals.insert(0, {
                 "Time": t_str, "Symbol": symbol, 
                 "Price": f"{price:.4f}" if price < 1 else f"{price:.2f}",
-                "C1": c1, "C3": c3, "C5": c5, "P/D": s_type,
+                "C1": c1, "C3": c3, "P/D": s_type,
                 "SnapP": self.stats_daily[symbol]["PUMP"], 
                 "SnapD": self.stats_daily[symbol]["DUMP"],
                 "Whale": is_whale
@@ -102,46 +105,57 @@ class MarketRadar:
             if len(self.signals) > MAX_DISPLAY_ROWS: self.signals.pop()
 
 @st.cache_resource
-def get_radar_instance(): 
-    return MarketRadar()
+def get_radar_instance(): return MarketRadar()
 
 def fetch_symbols_secure():
-    url = "https://api.bybit.com/v5/market/instruments-info?category=linear"
-    headers = {"User-Agent": "Mozilla/5.0"}
-    try:
-        response = requests.get(url, headers=headers, timeout=10)
-        if response.status_code == 200:
-            return [item['symbol'] for item in response.json()['result']['list'] if item['symbol'].endswith('USDT')]
-        return [f"ERR_{response.status_code}"]
-    except Exception as e:
-        return [f"CONN_ERR"]
+    # Ana domain ve yedek domain listesi
+    domains = ["api.bytick.com", "api.bybit.com"]
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "application/json",
+        "Referer": "https://www.bybit.com/"
+    }
+    
+    for domain in domains:
+        url = f"https://{domain}/v5/market/instruments-info?category=linear"
+        try:
+            response = requests.get(url, headers=headers, timeout=12)
+            if response.status_code == 200:
+                data = response.json()
+                syms = [item['symbol'] for item in data['result']['list'] if item['symbol'].endswith('USDT')]
+                if len(syms) > 10: return syms
+        except: continue
+    
+    return FALLBACK_SYMBOLS # Tüm API'ler çökerse yedek listeyi dön
 
 async def bybit_worker(radar_obj):
-    uri = "wss://stream.bybit.com/v5/public/linear"
+    # Streamlit Cloud IP'leri için stabil olan domain
+    uri = "wss://stream.bytick.com/v5/public/linear"
+    
     while True:
         symbols = fetch_symbols_secure()
-        if not symbols or "ERR" in symbols[0]:
-            radar_obj.add_log(f"API Hatası. Yeniden deneniyor...")
-            await asyncio.sleep(10); continue
-            
-        radar_obj.add_log(f"{len(symbols)} sembol izleniyor.")
+        radar_obj.add_log(f"{len(symbols)} sembol için bağlantı kuruluyor...")
+        
         try:
-            async with websockets.connect(uri, ping_interval=20) as ws:
-                # Bloklanmamak için yavaş abone ol
-                for i in range(0, len(symbols), 10):
-                    chunk = symbols[i:i+10]
+            async with websockets.connect(uri, ping_interval=20, ping_timeout=15) as ws:
+                # Bloklanmamak için çok daha yavaş abonelik (0.5 sn bekleme)
+                chunks = [symbols[i:i + 10] for i in range(0, len(symbols), 10)]
+                for chunk in chunks:
                     await ws.send(json.dumps({"op": "subscribe", "args": [f"tickers.{s}" for s in chunk]}))
-                    await asyncio.sleep(0.3)
+                    await asyncio.sleep(0.5)
+
+                radar_obj.add_log("Bağlantı ONLINE. Veriler taranıyor...")
                 
                 while True:
                     msg = await ws.recv()
                     data = json.loads(msg)
-                    if "topic" in data: radar_obj.process_ticker(data)
+                    if "topic" in data:
+                        radar_obj.process_ticker(data)
         except Exception as e:
-            radar_obj.add_log("Bağlantı koptu, 5sn sonra tekrar bağlanacak...")
-            await asyncio.sleep(5)
+            radar_obj.add_log(f"Bağlantı Hatası: {str(e)[:40]}...")
+            await asyncio.sleep(10)
 
-# --- UI TASARIMI (BİREBİR İLK KOD) ---
+# --- UI (Aynı Görsel Düzen) ---
 st.set_page_config(layout="wide", page_title="SinyalEngineer Bybit Whale")
 
 st.markdown("""
@@ -175,21 +189,20 @@ h2.markdown(f"<div style='margin-top:10px;'>{status_html}</div>", unsafe_allow_h
 h2.markdown(f'<a href="https://x.com/SinyalEngineer" target="_blank" style="color:white; text-decoration:none;">𝕏 @SinyalEngineer</a>', unsafe_allow_html=True)
 h3.metric("Pairs", radar.total_pairs)
 
-# Hata Günlüğü (AttributeError korumalı)
-logs = getattr(radar, 'log_messages', [])
+# Log Gösterici
 with st.expander("🛠️ Sistem Durumu"):
-    for m in list(logs)[::-1]: st.write(m)
+    for m in list(radar.log_messages)[::-1]: st.write(m)
 
 st.divider()
 
 col_side, col_main = st.columns([1, 4])
-with col_main:
-    search_query = st.text_input("Filter", placeholder="Symbol...").upper()
-    placeholder_main = st.empty()
-
 with col_side:
     st.subheader("🔥 Top 5 Activity")
     placeholder_side = st.empty()
+
+with col_main:
+    search_query = st.text_input("Filtrele", placeholder="Sembol (BTC, SOL...)").upper()
+    placeholder_main = st.empty()
 
 def get_color(val):
     if val > 0.1: return "#00ff88"
@@ -197,7 +210,6 @@ def get_color(val):
     return "white"
 
 while True:
-    # Sol Taraf - Top 5 Activity (Oklar Dahil)
     with placeholder_side.container():
         with radar.lock:
             sorted_stats = sorted(radar.stats_hourly.items(), key=lambda x: x[1]['PUMP'] + x[1]['DUMP'], reverse=True)[:5]
@@ -206,32 +218,23 @@ while True:
                 st.markdown(f'''<div class="stat-card"><a href="{tv_url}" target="_blank" class="sym-link">{sym}</a><br>
                 <small><span class="green-arrow">↑ {counts["PUMP"]}</span> | <span class="red-arrow">↓ {counts["DUMP"]}</span></small></div>''', unsafe_allow_html=True)
 
-    # Sağ Taraf - Canlı Sinyal Tablosu
     with placeholder_main.container():
         with radar.lock:
             signals = [s for s in radar.signals if search_query in s['Symbol']] if search_query else radar.signals
             if signals:
-                html = "<table><tr><th>Time</th><th>Symbol (Daily ↑/↓)</th><th>Price</th><th>1m</th><th>3m(T)</th><th>5m</th><th>Type</th></tr>"
+                html = "<table><tr><th>Time</th><th>Symbol (Daily ↑/↓)</th><th>Price</th><th>1m</th><th>3m(T)</th><th>Type</th></tr>"
                 for row in signals:
                     sym = row['Symbol']; p_count = row['SnapP']; d_count = row['SnapD']
-                    p_type = row['P/D']
-                    tv_url = f"https://www.tradingview.com/chart/?symbol=BYBIT:{sym}.P"
-                    
-                    row_class = ""
-                    whale_icon = ""
-                    if row['Whale']:
-                        whale_icon = " 🐳"
-                        row_class = ' class="whale-pump-row"' if p_type == "PUMP" else ' class="whale-dump-row"'
-                    
+                    p_type = row['P/D']; tv_url = f"https://www.tradingview.com/chart/?symbol=BYBIT:{sym}.P"
+                    row_class = f" class='{'whale-pump-row' if row['Whale'] and p_type=='PUMP' else ''}{'whale-dump-row' if row['Whale'] and p_type=='DUMP' else ''}'"
                     html += f"<tr{row_class}><td>{row['Time']}</td>"
-                    html += f"<td><a href='{tv_url}' target='_blank' class='sym-link'>{sym}{whale_icon}</a> <small class='green-arrow'>↑{p_count}</small> <small class='red-arrow'>↓{d_count}</small></td>"
+                    html += f"<td><a href='{tv_url}' target='_blank' class='sym-link'>{sym}{' 🐳' if row['Whale'] else ''}</a> <small class='green-arrow'>↑{p_count}</small> <small class='red-arrow'>↓{d_count}</small></td>"
                     html += f"<td>{row['Price']}</td>"
                     html += f"<td style='color:{get_color(row['C1'])};'>{row['C1']:+.2f}%</td>"
                     html += f"<td style='color:{get_color(row['C3'])}; font-weight:bold;'>{row['C3']:+.2f}%</td>"
-                    html += f"<td style='color:{get_color(row['C5'])};'>{row['C5']:+.2f}%</td>"
                     html += f"<td><span class='{'pump-label' if p_type=='PUMP' else 'dump-label'}'>{p_type}</span></td></tr>"
                 st.markdown(html + "</table>", unsafe_allow_html=True)
             else:
-                st.info("Bybit verileri taranıyor... Balina hareketleri bekleniyor. 🐳")
+                st.info("Piyasa taranıyor... Balina hareketi bekleniyor. 🐋")
     
     time.sleep(1)
